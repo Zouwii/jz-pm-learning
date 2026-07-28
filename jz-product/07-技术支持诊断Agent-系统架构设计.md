@@ -1,0 +1,620 @@
+# 技术支持诊断 Agent — 系统架构设计
+
+> 版本：V3.0  
+> 日期：2026-07-28  
+> 状态：设计阶段  
+> 关联文档：[PRD](./05-技术支持诊断Agent-PRD.md)
+
+---
+
+## 0. 文档定位
+
+本文档定义诊断 Agent 的生产级系统架构。架构经历三个阶段演进：
+
+```
+PoC 阶段（已完成）              生产阶段 V2（上版设计）     生产阶段 V3（本文档）
+─────────────────────────       ─────────────────────      ─────────────────────
+Claude Code + ttyd 终端          LangGraph 单 Agent 流程    ★ 条件多 Agent 架构
+单用户、单会话                    多租户部署                  有错误码→融合
+模型绑定 Claude                   多模型分层路由              无错误码→多 Agent 并行+仲裁
+手动触发                          三路证据 + 错误码关联       两套文档体系 (A类/B类)
+                                  回退 + 闭环                 并行 Worker + 仲裁 Agent
+```
+
+**V3 的核心变化**：引入两套文档体系和条件多 Agent 架构。Agent 的行为不再是固定的——有错误码时走确定性融合路径，没有错误码时走多 Agent 并行探索 + 仲裁路径。
+
+覆盖的核心模块：
+
+1. **两套文档体系** — A 类：错误码 Playbook（确定性）/ B 类：现场问题 TopK + 代码排查文档（探索性）
+2. **条件多 Agent 架构** — 有错误码 → 单 Worker 融合；无错误码 → 代码文档 Agent + 现场 Agent 并行 + 仲裁
+3. **文件同步管理** — FileAccessManager：共享缓存 + I/O 限流 + bag 回放隔离
+4. **LangGraph 编排引擎** — 12 节点 StateGraph + 条件分叉 + 断点续跑
+5. **多模型分层路由** — DeepSeek 扛日常 / Claude 做推理 / GLM-4 当备胎
+6. **回退 + 闭环 + 可观测性** — per-node retry/fallback + Case 沉淀 + LangSmith 全链路追踪
+
+---
+
+## 1. 系统全貌
+
+```
+                         ┌──────────────────┐
+                         │   应用工程师       │
+                         │   (浏览器访问)     │
+                         └────────┬─────────┘
+                                  │ HTTP
+                         ┌────────▼─────────┐
+                         │     FastAPI       │
+                         │  • 用户认证       │
+                         │  • Case CRUD      │
+                         │  • 异步队列       │
+                         │  • SSE 进度推送   │
+                         └────────┬──────────┘
+                                  │
+                         ┌────────▼──────────┐
+                         │   Session Manager  │  多租户隔离
+                         └────────┬───────────┘
+                                  │
+                         ┌────────▼──────────┐
+                         │  LangGraph 编排层  │
+                         │                    │
+                         │  ┌──────────────┐  │
+                         │  │ 数据采集 +    │  │
+                         │  │ 确定性分析    │  │  12 层 CLI，不调 LLM
+                         │  │ (CLI 1-10层) │  │
+                         │  └──────┬───────┘  │
+                         │         │          │
+                         │    ┌────▼────┐     │
+                         │    │有错误码？│     │  ★ 条件分叉
+                         │    └─┬────┬──┘     │
+                         │      │    │        │
+                         │  YES │    │ NO     │
+                         │      │    │        │
+                         │  ┌───▼──┐ ┌───────▼──────────────┐
+                         │  │融合  │ │  多 Agent 并行         │
+                         │  │路径  │ │                      │
+                         │  │     │ │ ┌──────────────────┐  │
+                         │  │ 错  │ │ │ 代码文档 Agent   │  │
+                         │  │ 误  │ │ │                  │  │
+                         │  │ 码  │ │ │ 搜 B 类文档      │  │
+                         │  │     │ │ │ 逐方向逐一排除    │  │
+                         │  │ 历  │ │ │ 代码文档推理     │  │
+                         │  │ 史  │ │ └────────┬─────────┘  │
+                         │  │     │ │          │            │
+                         │  │     │ │ ┌────────▼─────────┐  │
+                         │  │     │ │ │ 现场 Agent       │  │
+                         │  │     │ │ │                  │  │
+                         │  │     │ │ │ Thread 1: Top1   │  │
+                         │  │     │ │ │ Thread 2: Top2   │  │
+                         │  │     │ │ │ Thread 3: Top3   │  │
+                         │  │     │ │ │ 历史统计+站点特征 │  │
+                         │  │     │ │ └────────┬─────────┘  │
+                         │  │     │ │          │            │
+                         │  │     │ │     ┌────▼────┐       │
+                         │  │     │ │     │结论冲突？│       │
+                         │  │     │ │     └─┬────┬──┘       │
+                         │  │     │ │  一致 │    │ 冲突     │
+                         │  │     │ │       │    │          │
+                         │  └─────┼─┼───────┼────┼──────────┘
+                         │        │ │       │    │
+                         │  ┌─────▼─▼┐  ┌───▼────▼──────┐
+                         │  │ 融合    │  │ 仲裁 Agent    │
+                         │  │ (简单)  │  │               │
+                         │  │        │  │ 判断真冲突    │
+                         │  │ 语义   │  │ 评估证据强度  │
+                         │  │ 等价   │  │ 给出验证方向  │
+                         │  └───┬────┘  └───────┬───────┘
+                         │      │               │
+                         └──────┼───────────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │     结论 + 报告        │
+                    │                       │
+                    │  confirmed / likely   │
+                    │  need_human           │
+                    └───────────────────────┘
+
+共享组件:
+┌──────────────┐  ┌───────────────┐  ┌──────────────┐
+│FileAccessMgr │  │  LiteLLM      │  │  LangSmith   │
+│              │  │               │  │              │
+│ 文件缓存     │  │ DeepSeek 日常  │  │ 全链路追踪   │
+│ I/O 限流     │  │ Claude 推理   │  │ 节点级耗时   │
+│ Bag 回放隔离 │  │ GLM-4 备选    │  │ 评估指标     │
+└──────────────┘  └───────────────┘  └──────────────┘
+```
+
+---
+
+## 2. 核心技术栈
+
+| 层次 | 选型 | 选型原因 |
+|---|---|---|
+| Agent 编排 | **LangGraph StateGraph** | 声明式流程定义 + checkpointer 断点续跑 + 条件边分流 |
+| 模型路由 | **LiteLLM** | 统一接口 + 内置 fallback + cost tracking |
+| 工具协议 | **MCP Server** | 标准化协议，多语言跨进程 |
+| Web 框架 | **FastAPI** | 异步 + SSE 流式 + 自动 OpenAPI |
+| 可观测性 | **LangSmith** | LangGraph 原生集成，零代码全链路 trace |
+| 向量检索 | **pgvector** | 已有实现；数据量 < 100 万 chunks，够用 |
+| Checkpoint | **PostgresSaver** | 生产级持久化，多实例共享 |
+
+### 不引入的框架
+
+| 框架 | 原因 |
+|---|---|
+| **LangChain**（完整包） | StateGraph 来自 langgraph 包，不需要 Chain/Agent/Memory 抽象 |
+| **LlamaIndex** | RAG 用 pgvector + SQL 直接操作 |
+| **AutoGen / CrewAI** | 多 Agent 的逻辑由 LangGraph 条件边 + 自定义节点实现，不需要额外框架 |
+| **Dify / Coze** | 低代码平台无法集成自有的 12 层 CLI 和 JState META 解析 |
+
+---
+
+## 3. 两套文档体系
+
+诊断系统的知识分为两个来源，Agent 在不同场景下使用不同的知识体系：
+
+### 3.1 A 类：错误码排查文档（确定性的）
+
+```
+来源: error-code-analysis-doc-generator
+     从 JState META 注册表 + 源码反推
+     
+特征: 
+  • 一个错误码 → 一个 Playbook → 确定的触发链
+  • 6 章结构，第 6 章为机器可执行的 YAML Playbook
+  • 包含决策树（7 步）、候选原因（P1/P2，每个有唯一区分特征）
+  • 包含 Agent 结构化输出契约
+
+示例: 
+  614028 → "qrcodeCheck 超时，检查 /sensor_detector/visualmarks"
+  614002 → "两条触发链: 地图更新失败 / 任务节点属性非法"
+
+运行方式: CLI grep 执行，不调 LLM
+
+适用: 日志里有明确的 JState 错误码
+```
+
+### 3.2 B 类：现场问题 TopK + 代码排查文档（探索性的）
+
+```
+来源: 从真实 Case 中提取高频问题类型 → 结合源码写排查文档
+
+特征:
+  • 一个现象 → N 个可能方向 → 每个方向有排查路径
+  • 方向按历史频率排序（Top1: 40%, Top2: 30%, Top3: 20%, ...）
+  • 每个方向包含: 排查步骤、关键日志关键词、代码引用、历史 Case 统计
+  • 适用于"没有错误码，只有现象描述"的场景
+
+示例:
+  现象 "到点旋转不走":
+    方向1: 二维码定位丢失 (历史频率 40%)
+      排查: visualmarks topic → camera 进程 → 地面环境
+      代码: AbnormalCheck::qrcodeCheck()
+    方向2: REACH_ROTATE 超时 (历史频率 30%)
+      排查: diff_cur 精度 → 轮速差 → move_base 状态
+      代码: NavChecker::checkRotation()
+    方向3: 路径规划异常 (历史频率 20%)
+      排查: move_base → costmap → 导航路径
+    方向4: 其他 (历史频率 10%)
+
+运行方式: Agent 调 LLM 理解现象 → 匹配文档 → 多方向并行探索
+
+适用: 日志里没有错误码，只有现象描述
+```
+
+### 3.3 两套体系的互补
+
+```
+A 类: "我知道问题是什么（614028），告诉我怎么查"
+B 类: "我不知道问题是什么（旋转不走），帮我列出可能的方向"
+
+A 类为主力（有错误码时）         B 类为探索（无错误码时）
+─────────────────────────       ─────────────────────────
+确定性 grep 执行                  Agent + LLM 理解现象
+一条路径走到头                    多方向并行探索
+结论置信度高                      结论需要仲裁验证
+```
+
+---
+
+## 4. 条件多 Agent 架构
+
+### 4.1 设计原则
+
+多 Agent 不是默认开启的——由场景的不确定性决定：
+
+```
+Case 进入
+    │
+    ▼
+┌──────────────┐
+│  有错误码吗？  │
+└──┬────────┬──┘
+   │        │
+  YES      NO
+   │        │
+   ▼        ▼
+┌──────┐ ┌──────────────────────────┐
+│融合   │ │  多 Agent 并行 + 仲裁     │
+│路径   │ │                          │
+│      │ │  错误码系统退化为          │
+│      │ │  B 类文档搜索 + 代码分析   │
+└──────┘ └──────────────────────────┘
+```
+
+### 4.2 有错误码：融合路径
+
+错误码 Agent（主线） + 历史 Agent（辅助）。两者结论大概率一致——走简单融合。
+
+```
+错误码 Agent (主力):
+  52 个 Playbook，确定性 grep 执行
+  回答: "代码里这个错误码是怎么触发的？"
+
+历史 Agent (辅助):
+  token 匹配历史 Case
+  回答: "历史上这个错误码最后怎么解决的？"
+
+融合:
+  一次 LLM 推理，判断语义等价和因果链
+  大概率一致 → 直接输出结论
+```
+
+### 4.3 无错误码：多 Agent 并行 + 仲裁
+
+这是多 Agent 真正成立的场景。两个 Agent 用不同的方法论，结论可能冲突。
+
+#### Agent A: 代码文档 Agent
+
+```
+输入: 现象描述 + 日志内容
+方法: 搜索 B 类文档 → 按方向逐一排除
+推理方式: 代码和日志说了什么
+
+流程:
+  1. 匹配 B 类文档 "到点旋转不走"
+  2. 取 Top 方向，逐一排查:
+     方向1 (QR定位): grep visualmarks → 有数据 → 排除
+     方向2 (REACH_ROTATE): 查 diff_cur → 在阈值内 → 排除
+     方向3 (路径规划): 查 move_base → 正常 → 排除
+     方向4 (轮速差): 日志 left=0.85 right=0.91 → 差值 7% → ★ 命中
+  3. 查代码: 轮速差阈值在 speed_arbiter.cpp → 正常范围 ±5%
+  4. 结论: "轮速差超过阈值，导致反复旋转微调失败"
+  5. 置信度: medium (方向3的排除不够彻底)
+```
+
+#### Agent B: 现场 Agent（多线程并行）
+
+```
+输入: 现象描述 + 站点信息 + 日志内容
+方法: TopK 问题类型 × 多线程并行探索 + 历史统计
+推理方式: 历史上这个站点发生了什么
+
+流程:
+  Thread 1 (导航旋转类):
+    → 读 B 类文档 "到点旋转不走"
+    → 搜历史 Case: 8 个同类问题
+    → 统计: 5/8 是地面反光，1/8 是轮速差，2/8 是其他
+    → 站点特征: Zone3 环氧树脂地面，已知高湿度反光
+    → 结论: "Zone3 旋转问题 62.5% 是地面原因"
+    
+  Thread 2 (定位异常类):
+    → 搜历史 Case: 3 个同类问题
+    → QR 定位在 Zone3 不稳定（与地面反光相互印证）
+    → 结论: "定位异常与地面反光高度相关"
+    
+  Thread 3 (任务链路类):
+    → 搜历史 Case: 0 个匹配
+    → 结论: "任务链路可排除"
+
+汇总:
+  加权排序: 地面反光 (5/8, 62.5%) > 轮速差 (1/8, 12.5%)
+  结论: "地面反光导致 QR 相机误读，进而定位丢失、旋转微调失败。
+        轮速差 7% 可能是旋转过程中的正常波动，不是根因。"
+  置信度: high (跨线程验证: Thread 2 的定位异常与 Thread 1 相互印证)
+```
+
+#### 冲突点
+
+```
+Agent A → 轮速差（从代码和日志出发）
+Agent B → 地面反光（从历史统计和站点特征出发）
+
+★ 这不能简单融合——两个结论指向了不同的根因和不同的处置方案
+  • 轮速差 → 调 speed_arbiter 参数或检查轮子磨损
+  • 地面反光 → 改善地面或调整 QR 相机曝光参数
+```
+
+#### Agent C: 仲裁 Agent
+
+```
+仲裁 Agent 不吃任何一方的结论。只做三件事:
+
+1. 判断是真冲突还是同一因果链的不同层面
+   → "地面反光 → QR 误读 → 定位丢失 → 旋转异常 → 轮速微妙波动。
+      轮速差是结果，不是原因。两个 Agent 的结论不是真冲突，
+      而是因果链的不同环节。"
+   
+2. 评估证据强度
+   → "Agent A 的证据是代码级的（轮速阈值 ±5%，7% 确实超标），
+      但方向3的排除不够彻底。
+      Agent B 的证据是统计级的（5/8 = 62.5%），站点特征明确，
+      且有 Thread 2 的跨线程验证。
+      
+      综合判断: Agent B 的证据更强，因为统计样本 + 跨线程验证
+      + 站点特征形成了闭环。Agent A 的结论是单点指标异常，
+      没有排除'旋转中的正常波动'这个替代解释。"
+   
+3. 给出验证方向
+   → "建议现场验证: 
+      ① 在同一 Zone3 站点，用另一台车复现 → 如果同样旋转不走，
+         地面原因是主因。
+      ② 在非环氧树脂地面站点复现同一台车 → 如果正常，
+         排除轮速差问题。
+      ③ 两个验证中任何一个指向轮速差 → 再排查 speed_arbiter。"
+
+输出:
+  primary_conclusion: "地面反光（证据更强）"
+  alternative: "轮速差（不能完全排除，需验证）"
+  verification_plan: ["站点对比测试", "同车异地测试"]
+  immediate_action: "先按地面反光处置（清理地面、调相机曝光），
+                     如果问题复现再查轮速差"
+```
+
+---
+
+## 5. 文件同步管理 (FileAccessManager)
+
+两个 Agent 都涉及大量文件读取（日志、bag、历史 Case 报告）。并行执行时需要避免重复 I/O 和资源竞争。
+
+### 5.1 核心设计
+
+```python
+class FileAccessManager:
+    """所有 Agent/Worker 通过它请求文件内容"""
+    
+    def __init__(self):
+        self._cache: dict[str, bytes] = {}         # 已读取文件缓存
+        self._locks: dict[str, asyncio.Lock] = {}   # 每文件一把锁
+        self._io_semaphore = asyncio.Semaphore(2)   # 最多 2 个并发 I/O
+    
+    async def read(self, path: str, offset: int = 0, size: int = -1) -> bytes:
+        """读文件。缓存命中 → 直接返回；未命中 → 排队读 I/O"""
+        if path in self._cache:
+            return self._cache[path][offset:offset+size]
+        
+        async with self._io_semaphore:
+            async with self._get_lock(path):
+                if path not in self._cache:  # 排队期间可能已被其他 Worker 读取
+                    self._cache[path] = await self._read_file(path)
+        
+        return self._cache[path][offset:offset+size]
+    
+    async def replay_bag(self, path: str, topic: str, duration: int) -> dict:
+        """回放 bag。独占 I/O 槽，不和普通文件读取争抢"""
+        async with self._io_semaphore:
+            return await self._rosbag_play(path, topic, duration)
+```
+
+### 5.2 设计决策
+
+| 决策 | 原因 |
+|---|---|
+| 缓存已读文件 | 800MB 日志只读一次，所有 Worker 共享 |
+| Semaphore(2) | 最多 2 个并发 I/O，避免磁盘 IOPS 打满 |
+| 每文件一把锁 | 同一文件不被两个 Worker 同时读 |
+| Bag 回放占一个 I/O 槽 | Bag 回放是重 I/O，不和普通读取争抢 |
+| 读缓存先于 I/O 排队 | 最大化缓存命中，最小化磁盘访问 |
+
+---
+
+## 6. LangGraph 编排层
+
+### 6.1 完整 StateGraph
+
+```python
+graph = StateGraph(DiagnosisState)
+
+# ── 主路径：数据采集 + 确定性分析 ──
+graph.add_node("identify_source", identify_source)
+graph.add_node("collect_data", collect_data,
+    retry={"max_attempts": 3, "backoff": "exponential"})
+graph.add_node("classify_and_scan", classify_and_scan)
+graph.add_node("deep_insight_and_route", deep_insight_and_route)
+
+# ── ★ 条件分叉 ──
+def has_error_codes(state: DiagnosisState) -> Literal["fusion_path", "multi_agent_path"]:
+    if state.get("error_codes"):
+        return "fusion_path"
+    return "multi_agent_path"
+
+graph.add_conditional_edges("deep_insight_and_route", has_error_codes)
+
+
+# ── 路径 A: 有错误码 → 融合 ──
+graph.add_node("error_code_worker", ErrorCodeWorker().analyze)     # Playbook 确定性执行
+graph.add_node("history_worker_fusion", HistoryWorker().search)    # 历史辅助
+graph.add_node("fuse_simple", fuse_simple)                         # 简单融合
+graph.add_edge("error_code_worker", "fuse_simple")
+graph.add_edge("history_worker_fusion", "fuse_simple")
+
+
+# ── 路径 B: 无错误码 → 多 Agent 并行 + 仲裁 ──
+graph.add_node("doc_agent", CodeDocAgent().analyze)                # 代码文档 Agent
+graph.add_node("field_agent", FieldAgent().analyze)                # 现场 Agent（多线程）
+
+# 并行分叉 → 等待汇合
+graph.add_edge("deep_insight_and_route", "doc_agent")
+graph.add_edge("deep_insight_and_route", "field_agent")
+
+def has_conflict(state: DiagnosisState) -> Literal["arbitrate", "render"]:
+    """两个 Agent 结论是否冲突？"""
+    doc = state.get("doc_agent_result", {})
+    field = state.get("field_agent_result", {})
+    if doc.get("root_cause") != field.get("root_cause"):
+        return "arbitrate"
+    return "render"
+
+graph.add_node("arbitrate", ArbitrationAgent().arbitrate)          # 仲裁 Agent
+graph.add_conditional_edges("field_agent", has_conflict,
+    {"arbitrate": "arbitrate", "render": "render_report"})
+graph.add_edge("doc_agent", "arbitrate")  # doc_agent 完成后也进仲裁
+
+
+# ── 汇合 ──
+graph.add_node("render_report", render_report)
+graph.add_edge("fuse_simple", "render_report")
+graph.add_edge("arbitrate", "render_report")
+graph.add_edge("render_report", END)
+
+
+# ── 编译 ──
+checkpointer = PostgresSaver.from_conn_string(os.getenv("DATABASE_URL"))
+app = graph.compile(checkpointer=checkpointer)
+```
+
+---
+
+## 7. 多模型分层路由
+
+| 任务 | 主力模型 | Fallback | Max Tokens | 温度 | 成本 (¥/M token) |
+|---|---|---|---|---|---|
+| 入口追问 + 信息补全 | deepseek-chat | zhipu/glm-4 | 100 | 0.1 | ~0.5 |
+| Playbook 语义降级 | deepseek-chat | zhipu/glm-4 | 200 | 0.1 | ~0.5 |
+| 代码文档 Agent 推理 | deepseek-chat | zhipu/glm-4 | 300 | 0.2 | ~0.5 |
+| 现场 Agent 多线程推理 | deepseek-chat | zhipu/glm-4 | 200×N | 0.2 | ~0.5×N |
+| 证据融合 (简单) | deepseek-chat | zhipu/glm-4 | 300 | 0.2 | ~0.5 |
+| **证据仲裁 (冲突)** | **claude-sonnet-4** | zhipu/glm-4-plus | **500** | **0.3** | **~15.0** |
+| 钉钉 draft 格式化 | deepseek-chat | zhipu/glm-4 | 300 | 0.3 | ~0.5 |
+| 所有模型不可用 | 确定性规则融合 | — | — | — | 0 |
+
+**关键设计**：融合用便宜模型，仲裁用强推理模型。因为仲裁需要因果推理和证据权重判断——这是 Claude Sonnet 的优势场景。
+
+---
+
+## 8. 错误码关联推理
+
+- 上游优先拓扑排序
+- 共现模式触发联合排查
+- 不调 LLM，纯图遍历
+
+（完整设计见 V2.0 第 5 节，此处保留核心结构，不再重复展开。）
+
+---
+
+## 9. 回退系统
+
+per-step retry + fallback chain。LangGraph 节点级 retry policy（SSH/I/O 重试），确定性失败不重试（Playbook grep 失败走语义降级），模型层 LiteLLM fallback。
+
+（完整设计见 V2.0 第 6 节，此处保留核心配置，不再重复展开。）
+
+---
+
+## 10. 诊断闭环
+
+CLOSED Case 自动入库 + knowledge-draft 人工确认 + 同根因 ≥ 5 次触发 Playbook 增强。
+
+（完整设计见 V2.0 第 7 节，此处保留核心流程，不再重复展开。）
+
+---
+
+## 11. 可观测性
+
+LangSmith 原生集成，自动捕获每个节点的 trace。自定义指标：任务完成率、Playbook 命中率、融合准确率、仲裁触发率（新增）、人工介入率。
+
+（完整设计见 V2.0 第 8 节，此处保留核心指标，不再重复展开。）
+
+---
+
+## 12. Agent 职责边界
+
+| 节点 | 调 LLM？ | 模型 | 为什么 |
+|---|---|---|---|
+| identify_source | ✅ 入口不明时 | DeepSeek | 追问生成 |
+| collect_data | ❌ | — | 确定性 SSH/TB/文件 |
+| classify_and_scan | ❌ | — | 正则 + 关键词 |
+| deep_insight_and_route | ❌ | — | 6 项固定规则 |
+| error_code_worker | ❌ | — | grep pattern 匹配 |
+| history_worker_fusion | ❌ | — | token 匹配 |
+| fuse_simple | ✅ | DeepSeek | 语义等价 |
+| **doc_agent** | ✅ | **DeepSeek** | **B 类文档推理** |
+| **field_agent** | ✅ | **DeepSeek × N threads** | **多线程探索 + 统计推理** |
+| **arbitrate** | ✅ | **Claude Sonnet** | **因果推理 + 证据权重判断** |
+| render_report | ❌ | — | 模板填充 |
+
+**V3 新增的 LLM 介入点**：doc_agent、field_agent、arbitrate。这三个点在无错误码路径触发。
+
+---
+
+## 13. 部署架构
+
+```
+公司内网服务器 (Ubuntu)
+    │
+    ├── FastAPI (Uvicorn, 4 workers, 端口 5002)
+    │   ├── POST /api/cases          创建 Case
+    │   ├── GET  /api/cases/{id}     查询 Case 状态
+    │   ├── GET  /api/cases/{id}/stream  SSE 进度推送
+    │   └── GET  /api/cases/{id}/report  下载诊断报告
+    │
+    ├── Skill API (同一进程，不同路由)
+    │   ├── POST /api/skills/error-code/analyze
+    │   ├── POST /api/skills/case/similar
+    │   ├── POST /api/skills/playbook/execute
+    │   └── POST /api/skills/error-code/correlate
+    │
+    ├── LangGraph Agent Runner (BackgroundTask)
+    │   ├── Checkpointer: PostgresSaver
+    │   └── 每个 Case 一个 thread_id
+    │
+    ├── 外部依赖
+    │   ├── jz-claude-skills/scripts/diagnosis_cli.py (子进程调用)
+    │   ├── management-system (HTTP 调用 RAG + 错误码)
+    │   ├── DeepSeek API / GLM-4 API / Claude API
+    │   ├── 钉钉知识库 API (代理)
+    │   └── GitLab API (PAT)
+    │
+    └── Web UI (management-system 的 React 加一个页面)
+```
+
+三个 repo 的职责：
+
+| Repo | 角色 | 状态 |
+|---|---|---|
+| `jz-claude-skills` | CLI 引擎 + Playbook 知识库 + PoC Skills | **不动** |
+| `management-system` | 平台底座（RAG + 错误码 + 前端 + Auth） | **不动** |
+| `diagnosis-agent` | Agent 编排 + 模型路由 + 诊断 API | **新建** |
+
+---
+
+## 14. 实施计划
+
+| 阶段 | 内容 | 工作量 |
+|---|---|---|
+| Phase 1 | LangGraph StateGraph + 条件分叉 | 3 天 |
+| Phase 2 | LiteLLM 模型路由 | 1 天 |
+| Phase 3 | CLI 适配为 LangGraph 节点 | 2 天 |
+| Phase 4 | 两套文档体系 + 错误码关联图 | 2 天 |
+| Phase 5 | **多 Agent 路径（doc_agent + field_agent + arbitrate）** | **3 天** |
+| Phase 6 | **FileAccessManager** | **1 天** |
+| Phase 7 | FastAPI + Session Manager + Skill API | 2 天 |
+| Phase 8 | LangSmith 集成 | 0.5 天 |
+| Phase 9 | Checkpointer 升级 PostgresSaver | 0.5 天 |
+| Phase 10 | Case 沉淀闭环 | 1 天 |
+
+**总计：约 16 个人天。**
+
+---
+
+## 15. 决策日志
+
+| 日期 | 决策 | 依据 |
+|---|---|---|
+| 2026-07-27 | 不引入 Circuit Breaker | 诊断单 Case 串行，无并发级联故障风险 |
+| 2026-07-27 | 置信度使用四级定性体系 | LLM 自评数值置信度不可靠 |
+| 2026-07-28 | 编排层用 LangGraph | PoC 已验证。生产需要 checkpoint + retry + 可观测性 |
+| 2026-07-28 | 模型路由用 LiteLLM | 多模型分层策略，LiteLLM 统一接口 + 内置 fallback |
+| 2026-07-28 | 不引入 LangChain 完整包 | StateGraph 来自 langgraph 包，Chain/Agent/Memory 多余 |
+| 2026-07-28 | ★ 设计两套文档体系 (A/B) | A 类确定性 Playbook 覆盖有错误码场景；B 类探索性文档覆盖无错误码场景 |
+| 2026-07-28 | ★ 多 Agent 仅在无错误码时触发 | 有错误码→融合够用；无错误码→两个 Agent 方法论不同，结论可能真冲突 |
+| 2026-07-28 | ★ 仲裁 Agent 用 Claude Sonnet | 仲裁需要因果推理 + 证据权重判断，比融合的语义等价复杂一个量级 |
+| 2026-07-28 | ★ FileAccessManager 独立设计 | 多 Agent 并行 I/O 需要共享缓存 + 限流 + bag 回放隔离 |

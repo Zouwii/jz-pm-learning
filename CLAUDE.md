@@ -1,5 +1,27 @@
 # CLAUDE.md
 
+## ⚠️ 敏感词规则
+
+本仓库可能在公司环境打开。以下词汇用英文代替：
+
+| 中文（禁止） | 英文代替 |
+|-------------|---------|
+| 简历 | resume |
+| 公司 | company |
+| 跳槽 | job change |
+| 面试 | interview |
+| 投递 | apply |
+| offer | offer（保留）或 opportunity |
+| 产品经理 | PM |
+| 离职 | departure |
+| 薪资 | compensation |
+| 猎头 | headhunter |
+| 入职 | onboarding |
+
+> 所有对话和文档编辑，涉及以上词汇时自动切换英文。
+
+---
+
 ## 当前状态
 
 AI 产品经理转型中，目标 8 月面试。每天 90min 学习 + 练习。

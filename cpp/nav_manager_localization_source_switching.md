@@ -1,0 +1,365 @@
+# Nav-Manager + Nav-Net 定位源管理与切换系统
+
+> 本文整理 nav-manager 和 nav-net 两个仓库中，所有与**定位源管理、定位源切换、定位状态机**相关的内容。
+> 作为你的**副项目**，用于投递简历时展现"多传感器定位源切换"的系统工程能力。
+
+---
+
+## 一、系统全景
+
+### 两个仓库的分工
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      定位源管理系统                               │
+├──────────────────────────────┬───────────────────────────────────┤
+│       nav-manager            │           nav-net                  │
+│   (导航执行引擎, C++)        │    (导航网络/调度中间件, C++)       │
+│                              │                                    │
+│  • 路径感知定位源切换        │  • 机器人全局状态管理              │
+│  • 切换状态机 (RUNNING/SWITCH)│  • 定位状态发布与对外上报           │
+│  • TF坐标系感知 + 子图切换   │  • Position Recover 初始化          │
+│  • mark_switch 服务调用      │  • 二维码检码/伺服管理              │
+│  • 9种定位源管理             │  • 手动定位/恢复定位                │
+└──────────────────────────────┴───────────────────────────────────┘
+   ~38K LOC, 5层架构              ~2K LOC, WebSocket + ROS
+   主作者: hehongjie + zhr        主作者: hehongjie + zhr
+```
+
+### 核心定位源类型（跨仓库统一枚举）
+
+```cpp
+// nav-manager: frame_map.h
+enum class LocType { WORLD = 0, LASER, TEXTURE, HETEMAP, NUM };
+
+// nav-net: shared_struct.h
+enum LocalizationStatus {
+  kLaser = 1,           // 激光定位
+  kPrecise = 1 << 1,    // 局部精确定位
+  kTag = 1 << 2,        // 二维码定位
+  kIntensity = 1 << 3,  // 反射板定位
+  kStrip = 1 << 4,      // 条带定位
+  kOnlyImuWheelOdom,    // IMU+轮式里程计
+  kGps,                 // GPS
+  kUwb,                 // UWB
+  kTexture,             // 纹理定位
+  kCurb,                // 路沿定位
+  kGpsManual,           // 手动GPS
+};
+```
+
+---
+
+## 二、Nav-Manager 侧：定位源切换状态机
+
+### 核心文件：`hotstart_manager.cpp` (865行)
+
+这是整个定位切换系统的核心，由 hehongjie 搭建架构，zhr 完善时序控制。
+
+### 2.1 状态机设计
+
+```cpp
+// 两级状态
+enum { RUNNING, SWITCH };
+
+// RUNNING: 正常导航，当前定位源稳定
+// SWITCH:  正在切换定位源，等待新源有效后回到 RUNNING
+```
+
+状态转换流程：
+```
+RUNNING ──[路径边检查]──> SWITCH ──[waitLocValid()]──> RUNNING
+                            │
+                            └──[超时15s]──> 故障退出
+```
+
+### 2.2 路径边驱动的切换判断（navModeCheck）
+
+这是**整个系统最核心的函数**（149-517行），逻辑分五层：
+
+**第一层：定位状态读取**
+```cpp
+// 从全局 datastore 读取当前生效的定位源
+ros_ds_->localizationStatus(msg);
+// msg.value = LocType::LASER / HETEMAP / TEXTURE
+// msg.name = submap path (二维码子图路径)
+```
+
+**第二层：路径边属性解析**
+```cpp
+// 从地图中查询当前边和下一条边的定位源属性
+map_manager_->findEdge(cur_id, next_id, last_edge);
+// last_edge.loc_src.use_laser    → 是否支持激光
+// last_edge.loc_src.use_hete     → 是否支持二维码
+// last_edge.loc_src.use_texture  → 是否支持纹理
+```
+
+**第三层：交集判断（核心创新）**
+```cpp
+// 计算当前边和下一条边的定位源交集（位掩码）
+// 激光=bit2, 二维码=bit1, 纹理=bit0
+int loc_mask = (laser << 2) | (hete << 1) | texture;
+// 根据 loc_mask 值 + 当前 loc_type 决定是否切换
+// 例：loc_mask=0b110（激光+二维码交集），当前用激光 → 不切
+// 例：loc_mask=0b000（无交集），当前用激光→下条边只有二维码 → 切到二维码
+```
+
+**第四层：触发切换**
+```cpp
+// 激光→二维码：setHete(true, HETEMAP) + state=SWITCH
+// 二维码→激光：setLaser(HETEMAP) + state=SWITCH
+// 纹理↔激光：同上模式
+if (laser2hete && state_ == RUNNING) {
+    setHete(true, HETEMAP);      // 开启二维码定位源
+    setting_loc_type_ = HETEMAP; // 记录目标定位源
+    state_ = SWITCH;             // 进入切换等待
+}
+```
+
+**第五层：等待切换完成 + 关闭旧源**
+```cpp
+// SWITCH 状态下调用 waitLocValid()
+// - 检查 TF 是否可从新坐标系获取（如 tag_map→base_footprint）
+// - 超时 15 秒则报故障退出
+// - 成功：关闭旧源（如 setHete(false, HETEMAP)），回到 RUNNING
+```
+
+### 2.3 切换时序控制（zhr 的核心贡献）
+
+**每条边只触发一次**：
+```cpp
+// edge_sent_pair_ 记录已发送切换指令的边
+if (last_edge.id_src_index != edge_sent_pair_.first ||
+    last_edge.id_dest_index != edge_sent_pair_.second) {
+    callSetMarkSwitch(int_to_call, response);  // 调用底层定位源开关
+    edge_sent_pair_ = {src_index, dest_index}; // 记录已处理
+}
+```
+
+**边界保护**：
+- 旋转边不切换：`if (id == next_id && state_ == RUNNING) return true;`
+- 单边/末边兼容：`has_next_edge = false` 时走默认逻辑
+- 全局定位源同步：激光模式下，全局有二维码开启则主动关闭
+
+### 2.4 支持的定位源管理
+
+通过 `LocSourceInfo` 结构体管理 **9 种定位源**的开关状态和优先级：
+```
+cs_laser_num     → 激光编号
+cs_precise_num   → 局部精确定位
+cs_hete_num      → 二维码（异源）
+cs_intensity_num → 反光板
+cs_strip_num     → 条带
+cs_odom_num      → 里程计
+cs_gps_num       → GPS
+cs_uwb_num       → UWB
+cs_texture_num   → 纹理
+```
+
+通过 ROS Service `/mark_localization/set_mark_switch` 下发开关指令，并通过 `/state/setState` Topic 发布给前端展示。
+
+### 2.5 子图坐标系管理
+
+从 nav-manager 侧管理扫码得到的子图（submap）坐标系切换：
+```cpp
+// localization.cpp —— getWorldPose()
+if (loc_type == HETEMAP && !submap_path.empty()) {
+    // 从 tag_map 坐标系获取位姿
+    world_pose = updatePose("tag_map", stamp);
+    // 通过子图变换到世界坐标系
+    map_manager_->transPose(submap_path, world_pose);
+}
+```
+
+---
+
+## 三、Nav-Net 侧：机器人定位状态管理层
+
+### 核心文件：`robot_state.cpp` (648行)
+
+这是 nav-net 的定位状态管理中心，作为导航系统和外部（前端、调度）之间的桥梁。
+
+### 3.1 定位状态架构
+
+```
+RobotState (主类, ~650行)
+├── updateLocation()        → 主循环，100ms 周期
+│   ├── pubState()          → 发布节点心跳
+│   ├── updateLocalizationStatus()
+│   │   ├── 读取 localization_status_ 共享变量
+│   │   ├── 状态变化时发布 KeyLog
+│   │   └── 发布到 /nav/localization_status Topic
+│   └── updateTf("map", "base_footprint") → TF 监听
+├── locate()               → 手动定位请求
+│   ├── 支持 3D 激光 / 2D 激光
+│   ├── 调用 /map_manager_localization_3d/initial_pose
+│   └── 或 /mark_localization/initial_pose
+├── setOdoms()             → 设置 odom 传感器状态
+│   └── 调用 /mark_localization/set_mark_switch
+├── InformNav()            → 通知导航层地图更新
+├── initKdTree/initQrcodeKdTree() → 最近邻搜索
+└── findNearest/findNearestQrcode() → 找最近节点/码点
+```
+
+### 3.2 定位状态发布链路
+
+```
+nav-manager (HotStartManager)
+    │ 切换定位源
+    ▼
+/mark_localization/set_mark_switch  (Service)
+    │
+    ▼
+mark_localization 节点
+    │ 发布新的定位数据
+    ▼
+RobotState::updateLocalizationStatus()
+    │
+    ├─→ /nav/localization_status Topic  (ROS 参数)
+    ├─→ KeyLog (监控日志)
+    └─→ nav-manager 通过 RosDatastore 回读
+```
+
+**状态变化检测与上报**：
+```cpp
+if (localization_status.value != last_localization_state_) {
+    std::string loc_str = status_map[localization_status.value];
+    HDI->publishKeyLog(INFO, "当前生效的定位源为：" + loc_str);
+    last_localization_state_ = localization_status.value;
+}
+```
+
+### 3.3 支持的关键定位能力
+
+| 功能 | 实现位置 | 说明 |
+|------|---------|------|
+| 手动定位 | `locate()` | 支持从 JSON 请求设置初始位姿 |
+| 3D 激光兼容 | `locate()` | 根据 laserType 判断走 3D/2D 通道 |
+| 恢复定位 | `position_recover` 控制器 | 开机恢复定位，纯二维码场景复用激光位置 |
+| 二维码检码 | `qrcode_servo` 控制器 | 二维码地图加载、检码时序管理 |
+| 货架 TF | `updateLocation()` | 载货时读取 shelf_angle |
+| KdTree 搜索 | `initKdTree()` | PCL 构建最近邻搜索树 |
+
+### 3.4 恢复定位逻辑（position_recover 控制器）
+
+```
+开机启动 → 判断环境
+  ├── 纯二维码场景 → 复用上次激光位置
+  ├── 3D 激光场景 → 超时阈值 30s
+  └── 普通场景 → 标准初始化流程
+```
+
+---
+
+## 四、切换协议：nav-manager ↔ nav-net ↔ 底层定位
+
+```
+Nav-Manager (HotStartManager)
+    │
+    │ ① 路径边分析 → 判定需要切换
+    │ ② setHete(true/false, locType)  →  /carly/heteServo/nav
+    │ ③ callSetMarkSwitch(int)  →  /mark_localization/set_mark_switch
+    │ ④ setLaserMode(loc_param) →  supervisor 下发
+    │
+    ▼
+底层定位节点 (mark_localization / heteServo / map_manager)
+    │
+    │ ⑤ 开启/关闭对应定位源
+    │ ⑥ 开始发布新的定位 TF 数据
+    │
+    ▼
+Nav-Manager (HotStartManager)
+    │ ⑦ waitLocValid() → 监听 TF 是否可用
+    │ ⑧ 切换完成 → 关闭旧定位源
+    │ ⑨ state = RUNNING
+    │
+    ▼
+Nav-Net (RobotState)
+    │ ⑩ updateLocalizationStatus() → 感知状态变化
+    │ ⑪ 发布 KeyLog + /nav/localization_status
+    │
+    ▼
+前端 / 调度系统
+```
+
+---
+
+## 五、个人贡献归因
+
+### 你（zhr）在这个系统中实际做的事：
+
+| 模块 | 贡献内容 | 证据 |
+|------|---------|------|
+| **切换时序控制** | 每条边只触发一次切换、单边/末边/旋转边保护 | `fadee070`, `85409489`, `21999562` 等 |
+| **交集判断升级** | 从并集判断改为交集判断 + 位掩码匹配 | 4 种 loc_mask 集合的定义和匹配逻辑 |
+| **hotstart 热切换** | 切换后等待 TF 可用、超时处理 | `waitLocValid()` 的 TF 检查逻辑 |
+| **二维码关闭修复** | nav-net 中修复二维码关闭问题 | `10baa00`, `5006dc0` |
+| **热更新 + 定位切换** | 地图热更新时定位状态的正确复位 | `58d630f8`, `99524716` |
+| **全局定位源同步** | `globalLocSourceSync()` 逻辑 | 激光模式下检测全局二维码开启并关闭 |
+
+### 他洪杰搭建的基座（引用但不冒名）：
+
+- HotStartManager 整体类结构 + LocSourceInfo 九源管理
+- `navModeCheck()` 主框架
+- `setHete()` / `setLaserMode()` 基础服务接口
+- nav-net 的 `RobotState` 类 + `position_recover` 控制器
+
+---
+
+## 六、简历包装建议
+
+### 项目名称
+
+> **多传感器定位源协同切换系统**（nav-manager + nav-net）
+
+### 一句话定位
+
+> 在机器人导航系统中负责激光/二维码/纹理等多定位源的协同切换逻辑——基于路径边属性的位掩码交集判定 + 两级状态机实现切换时序控制和边界保护。
+
+### 简历正文（3-4 行版）
+
+> 参与移动机器人多定位源协同切换系统的开发与优化。在 nav-manager 导航引擎侧，基于路径边属性实现激光/二维码/纹理三种定位源的交集位掩码判定算法，通过 RUNNING-SWITCH 两级状态机控制切换时序，确保每条边只触发一次切换。实现单边、末边、旋转边的边界条件保护，并通过 TF 坐标系监听验证切换完成。在 nav-net 侧参与定位状态上报链路，修复二维码关闭与热更新场景下的定位状态异常。
+
+### 面试追问准备
+
+1. **为什么用位掩码而不是 if-else 链？**
+   → 三种定位源 × 当前状态 × 下条边状态组合爆炸，位掩码 + 哈希集合查表效率最高。
+
+2. **RUNNING → SWITCH 切换失败怎么处理？**
+   → 15秒超时，分为"热启动超时"（路径进度 >90% 或 <10% 时放宽）和"任务超时"（从 mb_fb timestamp 算）；超时后上报 `QRCODE_INIT_TIMEOUT` 异常。
+
+3. **怎么保证定位切换不丢定位？**
+   → 先开启目标定位源（setHete true），等待 TF 确认可用（waitLocValid），再关闭旧源（setHete false）。
+
+4. **tag_map、fm_map 和 map 坐标系如何统一？**
+   → nav-manager 的 `Localization::getWorldPose()` 根据当前 loc_type 从对应 TF 坐标系获取位姿，再通过 `map_manager_->transPose(submap_path)` 变换到世界坐标系。
+
+5. **nav-manager 和 nav-net 的职责划分？**
+   → nav-manager 负责切换决策和执行（状态机+服务调用），nav-net 负责状态发布和对外上报（前端、调度、监控）。
+
+### 可量化指标（需要补充）
+
+- 切换成功率：xx%
+- 平均切换耗时：xx ms
+- 支持的定位源数量：3 种（激光/二维码/纹理）通过边属性自动匹配
+- 覆盖车型：差速、舵轮、叉车、宇树狗
+- 异常率：xx%
+
+---
+
+## 七、关键代码行数统计
+
+| 文件 | 行数 | 归属 |
+|------|------|------|
+| `hotstart_manager.cpp` | 865 | hehongjie + zhr |
+| `localization.cpp` | 204 | hehongjie + zhr |
+| `robot_state.cpp` (nav-net) | 648 | hehongjie + zhr |
+| `visualmarks_detect.cpp` | - | hehongjie |
+| `tag_checker.cpp` | - | hehongjie |
+| `position_recover.cc` (nav-net) | - | hehongjie |
+| `qrcode_servo.cc` (nav-net) | - | hehongjie |
+
+---
+
+> 📅 生成时间：2026-07-23
+> 📁 文件路径：`ai/pm-learning/cpp/nav_manager_localization_source_switching.md`
